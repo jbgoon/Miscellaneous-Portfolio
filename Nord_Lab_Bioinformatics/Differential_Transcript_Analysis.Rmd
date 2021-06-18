@@ -1,0 +1,274 @@
+---
+title: "Differential Transcript Usage Analysis"
+author: Jack Goon
+start date: 07/10/2019
+end date: 09/27/2019
+output: html_document
+---
+
+In this analysis, I use bash scripts to gather my data, salmon to align transcripts and quantify transcript counts, and DRIMSeq to analyze differential transcript usage. Generally, I followed the pipeline described [here](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6178912/) Below, I will show all of my steps. This pipeline isn't finished -- the DRIMSEQ portion should theoretically work, but doesn't work efficiently yet. 
+
+The workspace for this script, once it is run, is here:
+```{r, eval=FALSE}
+load("/Users/jackbgoon/Desktop/NordLab/DTU_analysis/Workspace/Final_Workspace.RData")
+```
+
+# Part 1: Data Gathering
+
+First, I organized all relevant raw data into a directory (/share/nordlab/users/jbgoon/fastq_data), organized by timepoint and condition. This was done manually by referring to a metadata spreadsheet which shows sampleID's, condition, timepoint, and more.
+
+```{r, echo=F, message=F}
+library(knitr)
+sampleinfo <- read.csv("/Users/jackbgoon/Desktop/NordLab/DTU_analysis/sample.info_complete.csv", header=T)
+rownames(sampleinfo) <- sampleinfo$X
+sampleinfo$X <- NULL
+kable(head(sampleinfo))
+```
+
+
+# Part 2: Salmon
+
+Salmon, desribed briefly [here](https://combine-lab.github.io/salmon/about/) and in detail [here](https://www.biorxiv.org/content/10.1101/021592v1.full), creates transcript-level count estimates from RNA-seq data. I used the *quasi-mapping-based* mode of salmon, which aligns sequencing fragments and creates transcript abundance estimates (in Transcripts per million, or TPM). 
+
+### Indexing
+
+Salmon uses a "kmer" length, which is the minumum length for a valid match during alignment. While the default kmer length is 31, the documentation advises using a shorter kmer for reads under 75 base pairs. Our library contains reads of 50 base pairs, so I experimented with 3 different kmer lengths on 3 different samples (from 3 different timepoints). I observed the following mapping rates (Values are %):
+
+data.frame <- c("","12.5","14.5","17.5") + c("kmer19","91.36","89.39","90.29") +c("kmer25","90.99","89.25","90.01") +c("kmer31", "89.34", "88.18", "88.8")
+```{r, eval=FALSE}
+Timepoint <- c("12.5","14.5","17.5")
+kmer19 <- c("91.36","89.39","90.29")
+kmer25 <- c("90.99","89.25","90.01")
+kmer31 <- c("89.34", "88.18", "88.8")
+kmer_test <- data.frame(Timepoint,kmer19,kmer25,kmer31)
+kable(kmer_test)
+```
+
+Since kmer=19 index provided a higher mapping rate, I proceeded with kmer=19. Below is the script to generate that index. Indexing uses an mRNA fasta file downloaded from the [UCSC website](http://hgdownload.cse.ucsc.edu/goldenPath/mm9/bigZips/mrna.fa.gz), which is also available in /share/nordlab/users/jbgoon/Reference/mm9/mrna.fa
+
+```{r, engine=bash, error=F, message=F}
+#!/bin/bash 
+#SBATCH --job-name=index_kmer19
+#SBATCH --time=01:00:00
+#SBATCH --mem=14000
+#SBATCH -n 8
+
+cd /share/nordlab/users/jbgoon/salmon
+./salmon-latest_linux_x86_64/bin/salmon index -t /share/nordlab/users/jbgoon/Reference/mm9/mrna.fa -i index_kmer19 -k 19
+```
+
+### Quantification
+
+I completed quantification with several scripts, at least one for each timepoint. All scripts are available at /share/nordlab/users/jbgoon/salmon/quants, within the timepoiont directories. Here is the script for quantifying all 12.5 samples.
+
+```{r, engine='bash', eval=FALSE}
+#!/bin/bash
+#SBATCH --job-name=12_5_salmon.sh
+#SBATCH --time=03:00:00
+#SBATCH --mem=16000
+#SBATCH -n 8
+
+for i in /share/nordlab/users/jbgoon/fastq_data/12_5/*/*.fastq.gz;
+do
+
+# Used for filing the salmon outputs into correct directories
+FILENAME=$(basename ${i})
+FILESHORT=${FILENAME%.*.*} # removes .fastq.gz extension
+FILEPATH=$(dirname ${i})
+CONDNAME=$(basename ${FILEPATH})
+CONDPATH=$(dirname ${FILEPATH})
+TIMENAME=$(basename ${CONDPATH})
+TIMEPATH=$(dirname ${CONDPATH})
+
+# Create output directories
+mkdir /share/nordlab/users/jbgoon/salmon/quants/$TIMENAME/$CONDNAME/$FILESHORT
+cd /share/nordlab/users/jbgoon/salmon
+
+# Running salmon quantification.
+./salmon-latest_linux_x86_64/bin/salmon quant \
+-i ./index_kmer19 \
+-l A \
+-r ${i} \
+--validateMappings \
+--seqBias \
+--gcBias \
+--posBias \
+-o /share/nordlab/users/jbgoon/salmon/quants/$TIMENAME/$CONDNAME/$FILESHORT
+done
+```
+
+-i refers to the index generated earlier
+-l A allows salmon to automatically determine the library type
+-r refers to the input fastq file
+--validateMappings allows for selective alignment
+--seqBias accounts for sequent specific biases.
+--gcBias accounts for GC bias. This feature is in beta for unpaired readings.
+--posBias accounts for 5' to 3' bias. This feature is "experimental."
+-o provides the output location.
+
+### Results
+
+Following salmon quantification, I had a directory /share/nordlab/users/jbgoon/salmon/quants that contained salmon quant data sorted by timepoint, condition, and sample name.
+
+# Part 3: Analysis with R
+
+Load packages
+``` {r, message = FALSE, warning = FALSE}
+library(tximport) # import salmon data to R
+library(GenomicFeatures) # map transcripts to genes
+library(DRIMSeq) # analyze differential transcript usage with the Dirichlet-multinomial model
+library(ggplot2) # plot data
+library(biomaRt)
+library(dplyr)
+```
+
+Import salmon data into R
+```{r, message = FALSE, eval=FALSE}
+# import sampleinfo
+sampleinfo <- read.delim("/Users/jackbgoon/Desktop/NordLab/DTU_analysis/sample.info_outliers.csv", sep=',')
+
+# reformat sample info
+sampleinfo$DPC <- gsub('.','_', sampleinfo$DPC, fixed=TRUE)
+
+# housekeeping name changes
+samplenames <- sampleinfo[,"SampleID"]
+samplenames <- sub(".R1.001", "", samplenames)
+samplenames <- sub("MIA.e12.5.", "", samplenames)
+samplenames <- sub("MIA.e17.5.", "", samplenames)
+samplenames <- sub(".fastq.gz", "", samplenames)
+
+# re-labelled P0 samples that were merged and renamed, to match count data
+samplenames <- sub("MIA.P0.1.S44.L006","MIA.P0.allmerged.1",samplenames)
+samplenames <- sub("MIA.P0.2.S45.L006","MIA.P0.allmerged.2",samplenames)
+samplenames <- sub("MIA.P0.3.S46.L006","MIA.P0.allmerged.3",samplenames)
+samplenames <- sub("MIA.P0.4.S47.L006","MIA.P0.allmerged.4",samplenames)
+samplenames <- sub("MIA.P0.5.S48.L006","MIA.P0.allmerged.5",samplenames)
+samplenames <- sub("MIA.P0.6.S49.L006","MIA.P0.allmerged.6",samplenames)
+samplenames <- sub("MIA.P0.7.S50.L006","MIA.P0.allmerged.7",samplenames)
+samplenames <- sub("MIA.P0.8.S51.L006","MIA.P0.allmerged.8",samplenames)
+samplenames <- sub("MIA.P0.9.S52.L006","MIA.P0.allmerged.9",samplenames)
+samplenames <- sub("MIA.P0.10.S53.L006","MIA.P0.allmerged.10",samplenames)
+samplenames <- sub("MIA.P0.11.S54.L006","MIA.P0.allmerged.11",samplenames)
+samplenames <- gsub("L001", "L001.R1.001",samplenames)
+samplenames <- gsub("L002", "L002.R1.001",samplenames)
+samplenames <- gsub("L003", "L003.R1.001",samplenames)
+samplenames <- gsub("L004", "L004.R1.001",samplenames)
+samplenames <- gsub("L005", "L005.R1.001",samplenames)
+samplenames <- gsub("L006", "L006.R1.001",samplenames)
+samplenames <- gsub("L007", "L007.R1.001",samplenames)
+samplenames <- gsub("L008", "L008.R1.001",samplenames)
+samplenames <- gsub(".R1.001.R1.001", ".R1.001",samplenames)
+sampleinfo[,"SampleID"] <- samplenames
+
+# creating samples data frame, used to import files
+# I altered the quants directory to use 19_5 instead of P0, and to have all sample names use periods instead of underscores/dashes
+samples <- data.frame(SampleID=sampleinfo$SampleID, DPC=sampleinfo$DPC, Condition=sampleinfo$Condition, Group=sampleinfo$ExperimentalDesign)
+
+# importing Salmon quant files
+files <- file.path("/Users/jackbgoon/Desktop/NordLab/DTU_analysis/2_Salmon/quants", samples$DPC, samples$Condition, samples$SampleID, "quant.sf")
+names(files) <- samples$SampleID
+
+#Using tximport. Import counts, scaled to library size
+txi <- tximport(files, type="salmon", txOut=TRUE, countsFromAbundance="scaledTPM") 
+cts <- txi$counts
+cts <- cts[rowSums(cts) > 0,]
+```
+
+Map transcripts to genes, apply this to cts dataframe, create counts dataframe
+```{r, message = FALSE, eval=FALSE}
+# Code to create txdf dataframe, maps geneID to txname. Mysteriously stopped working on the liine using "select" method. Below, I load the txdf as a csv. 
+
+gtf <- "/Users/jackbgoon/Desktop/NordLab/DTU_analysis/3_R_analysis/Mus_musculus.GRCm38.97.gtf"
+txdb.filename <- "genes.gtf.sqlite"
+txdb <- makeTxDbFromGFF(gtf)
+saveDb(txdb, txdb.filename)
+txdb <- loadDb(txdb.filename)
+txdf <- biomaRt::select(txdb, keys(txdb, "GENEID"), "TXNAME", "GENEID")
+tab <- table(txdf$GENEID)
+txdf$ntx <- tab[match(txdf$GENEID, names(tab))]
+
+# Remove unnecessary decimal from transcriptIDs in cts, since it doesn't exist in txdf
+txnames <- rownames(cts)
+txnames <- read.table(text=txnames, sep='.', as.is=T)
+txnames <- txnames$V1
+rownames(cts) <- txnames
+
+# Match txdf transcripts to those found in cts
+txdf <- txdf[match(rownames(cts),txdf$TXNAME),]
+
+# Combine geneID, txname, and cts data into a new "counts" dataframe
+counts <- data.frame(gene_id=txdf$GENEID, feature_id=txdf$TXNAME, cts)
+colnames(counts) <- gsub("X", "", colnames(counts))
+```
+
+Organize samples
+```{r, warning=F, message=F}
+# Saline=1, PolyIC=2, Inhibitor=3
+group<-ifelse(sampleinfo$Condition=="Saline", 1, 3)
+group<-ifelse(sampleinfo$Condition=="PolyIC", 2, group)
+
+# Male=1, Female=2
+sex_rna<-ifelse(sampleinfo$sex_by_rna=="M", 1, 2)
+
+# Normal=0, Outlier=1
+outlier <- ifelse(sampleinfo$Outlier=="0", 0, 1)
+
+# Other factors
+lane<-sampleinfo$Lane
+DPC<- ifelse(sampleinfo$DPC=="12_5", 12.5, NA)
+DPC <- ifelse(sampleinfo$DPC=="14_5", 14.5, DPC)
+DPC <- ifelse(sampleinfo$DPC=="17_5", 17.5, DPC)
+DPC <- ifelse(sampleinfo$DPC=="19_5", 19.5, DPC)
+ID <-sampleinfo$SampleID
+```
+
+Run DRIMSEQ. Unfortunately, I had a hard time to get this function working efficiently before the summer ended. The DRIMSEQ documentation says that these functions should only take 30 minutes or so, but I couldn't finish in under 5 hours. 
+
+I attempted to run this section of code on the server, so that more computational power could be used. To do so, in R on linux, I had to install packages onto my local directory using the command `install.packages("dplyr", lib="/share/nordlab/users/jbgoon/DTU/library")` for all necessary packages. Then I loaded the packages with `library(dplyr, lib.loc="/share/nordlab/users/jbgoon/DTU/library")`
+```{r, message=F, warning=F, error=F}
+dtu_timepoint_function <- function(timepoint){
+  
+control.data <- intersect(which(group=="1"), which(lane!=12))
+control.data <- intersect(control.data, which(DPC==timepoint))
+control.data <- intersect(control.data, which(outlier==0))
+  
+polyic.data <- intersect(which(group=="2"), which(lane!=12))
+polyic.data <- intersect(polyic.data, which(DPC==timepoint))
+polyic.data <- intersect(polyic.data, which(outlier==0))
+  
+use.cols <- c(control.data, polyic.data) # columns to be used in experiment
+  
+# remove duplicate transcripts, and any transcripts not mapped to geneid
+counts <- distinct(counts, feature_id, .keep_all=T)
+counts <- na.omit(counts)
+
+# create design matrix
+test.ID <- ID[use.cols]
+test.group <- group[use.cols]
+test.sex <- sex_rna[use.cols]
+test.lane <- lane[use.cols]
+test.DPC <- DPC[use.cols]
+test.data <- counts[,c(1,2,use.cols+2)]
+test.samples <- data.frame(sample_id=test.ID, KD=test.group)
+design <- model.matrix(~test.sex+test.lane+test.group)
+
+# Run DRIMSeq
+d <- dmDSdata(counts=test.data, samples=test.samples)
+
+# Filter data. Relevant genes must be expressed (5 counts) in all samples, relevant transcripts must be expressed (5 counts) in half of all samples
+n <- length(use.cols) # number of samples
+n.small <- as.integer(0.5*n)
+d <- dmFilter(d, min_samps_feature_expr=n.small, min_feature_expr=5, min_samps_gene_expr=n, min_gene_expr=)
+
+# set seed for reproducibility
+set.seed(123)
+
+# Calculate precision data
+# Ran dmPrecision in base R for efficiency. Here is that Rdata file:
+# load("/Users/jackbgoon/Desktop/NordLab/DTU_analysis/8.26.19.RData")
+d <- dmPrecision(d, design=design, verbose = 0, BPPARAM=BiocParallel::SerialParam())
+d <- dmFit(d, design=design, verbose=0)
+d <- dmTest(d, coef=test.group)
+d
+}
+```
